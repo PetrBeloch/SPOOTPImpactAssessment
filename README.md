@@ -1,27 +1,28 @@
-# Get-SPOOTPImpactAssessment
+# SPO OTP Retirement Impact Assessment
 
-Assesses the impact of **SharePoint One-Time Passcode (SPO OTP) retirement** ([MC1243549](https://mc.merill.net/message/MC1243549)) on your Microsoft 365 tenant.
+Toolset for assessing the impact of **SharePoint One-Time Passcode (SPO OTP) retirement** ([MC1243549](https://mc.merill.net/message/MC1243549)) on your Microsoft 365 tenant.
 
-Starting **July 2026**, external users who access SharePoint/OneDrive via SPO OTP and **do not have** a Microsoft Entra B2B guest account will receive **Access Denied**. This script identifies those users before the cutoff so you can take action proactively.
+Starting **July 2026**, external users who access SharePoint/OneDrive via SPO OTP and **do not have** a Microsoft Entra B2B guest account will receive **Access Denied**.
 
-## What It Does
+## Background: SPO OTP vs Entra B2B Email OTP
 
-1. Retrieves all **Entra ID B2B guest accounts** (these users are safe — not affected)
-2. Enumerates **external users** across all SharePoint site collections
-3. Cross-references the two lists to find external users **without** a B2B guest account
-4. Filters out **inactive/stale accounts** based on a configurable threshold
-5. Maps each affected user to the **specific sites** they have access to
-6. Enriches activity data from **Unified Audit Log** (if available)
-7. Exports a **CSV report** with impact classification (HIGH / LOW)
+These are **two different mechanisms** — understanding the difference is key:
 
-## Operating Modes
+| | SPO OTP (retiring) | Entra B2B Email OTP |
+|---|---|---|
+| Where it lives | SharePoint layer | Microsoft Entra ID |
+| Creates guest account in Entra? | **No** — user exists only in SharePoint external user store | **Yes** — creates B2B guest account |
+| Visible in Graph API? | **No** | Yes |
+| What happens after retirement | User gets **Access Denied** | Continues working normally |
 
-| Mode | How | Pros | Cons |
-|------|-----|------|------|
-| **SPO + Graph** (default) | SPO Management Shell + Graph REST API | Most detailed data, includes `WhenCreated`, per-site external user lists | Requires SPO module auth to work |
-| **Graph-only** (`-GraphOnly`) | Microsoft Graph API only | No SPO module dependency, works everywhere | Less detailed per-site data |
+After SPO OTP retires, all external authentication routes through Entra B2B. If a guest has no Microsoft Account, no federated identity, and **Entra Email OTP is disabled**, they will be forced to create a Microsoft Account to access shared content.
 
-If SPO module authentication fails, the script **automatically falls back** to Graph-only mode.
+## Contents
+
+| File | Purpose |
+|------|---------|
+| `Test-SPOOTPDiagnostic.ps1` | **Step 1** — Quick diagnostic (1–2 min). Checks tenant config and estimates impact. |
+| `Get-SPOOTPImpactAssessment.ps1` | **Step 2** — Full assessment with detailed CSV report. |
 
 ## Requirements
 
@@ -29,162 +30,197 @@ If SPO module authentication fails, the script **automatically falls back** to G
 
 | Module | Required | Purpose |
 |--------|----------|---------|
-| `Microsoft.Graph.Authentication` | **Yes** | All Entra ID / Graph API queries |
-| `Microsoft.Online.SharePoint.PowerShell` | No (recommended) | SPO site/external user enumeration |
-| `ExchangeOnlineManagement` | No (recommended) | Unified Audit Log enrichment for accurate last-activity dates |
+| `Microsoft.Graph.Authentication` | **Yes** | Entra ID queries, Email OTP policy check |
+| `Microsoft.Online.SharePoint.PowerShell` | Recommended | SPO tenant settings, external user enumeration |
+| `ExchangeOnlineManagement` | Optional | Unified Audit Log enrichment for last-activity dates |
 
-> **Note:** `Microsoft.Graph.Users` and `Microsoft.Graph.Reports` are intentionally **not used**. The SPO module bundles its own version of Graph assemblies, causing version conflicts. All Graph queries use `Invoke-MgGraphRequest` (REST) instead.
+> **Note:** `Microsoft.Graph.Users` and other Graph submodules are intentionally **not used**. The SPO module bundles its own version of Graph assemblies, causing version conflicts. All Graph queries use `Invoke-MgGraphRequest` (REST) instead.
 
 ### Permissions
 
-| Service | Role / Scope |
-|---------|-------------|
-| SharePoint Online | SharePoint Administrator (for SPO mode) |
-| Microsoft Graph | `User.Read.All`, `AuditLog.Read.All`, `Sites.Read.All` |
-| Exchange Online | Access to Unified Audit Log (optional, for activity enrichment) |
+| Service | Required Role / Scope |
+|---------|----------------------|
+| Microsoft Graph | `Policy.Read.All`, `User.Read.All`, `IdentityProvider.Read.All`, `AuditLog.Read.All`, `Sites.Read.All` |
+| SharePoint Online | SharePoint Administrator or Global Administrator |
+| Exchange Online | Access to Unified Audit Log (optional) |
 
 ### PowerShell Version
 
-- **PowerShell 5.1** — fully compatible
-- **PowerShell 7.x** — fully compatible
+Compatible with **PowerShell 5.1** and **PowerShell 7.x**.
 
-## Installation
+### Installation
 
 ```powershell
-# Install required modules (if not already present)
 Install-Module Microsoft.Graph.Authentication -Scope CurrentUser
-Install-Module Microsoft.Online.SharePoint.PowerShell -Scope CurrentUser  # optional
-Install-Module ExchangeOnlineManagement -Scope CurrentUser                # optional, for audit log
+Install-Module Microsoft.Online.SharePoint.PowerShell -Scope CurrentUser
+Install-Module ExchangeOnlineManagement -Scope CurrentUser   # optional
 
-# Clone or download the script
-git clone https://github.com/yourrepo/Get-SPOOTPImpactAssessment.git
+git clone https://github.com/yourrepo/SPO-OTP-Impact-Assessment.git
 ```
 
-## Usage
+---
 
-### Basic (auto-detects best mode)
+## Step 1: Run the Diagnostic
+
+`Test-SPOOTPDiagnostic.ps1` runs in **1–2 minutes** and answers the key questions:
+
+1. **Is Entra B2B Email OTP enabled?** — If not, guests will be forced to create Microsoft Accounts after retirement.
+2. **Is `EnableAzureADB2BIntegration` already on?** — If yes, your tenant already routes external sharing through Entra B2B and the impact is minimal.
+3. **What is the tenant's `SharingCapability`?** — Determines the scope of external sharing.
+4. **How many SPO external users exist without a B2B guest account?** — The actual number of at-risk users.
+5. **Which external identity providers are configured?** — Federation, MSA, Email OTP.
+
+### Usage
 
 ```powershell
-.\Get-SPOOTPImpactAssessment.ps1 -TenantName 'contoso'
+# Connect to SPO first (recommended for full results)
+Connect-SPOService -Url 'https://contoso-admin.sharepoint.com'
+
+# Run diagnostic
+.\Test-SPOOTPDiagnostic.ps1 -TenantName 'contoso'
 ```
 
-### Graph-only mode (skip SPO module entirely)
+If SPO connection is not possible, the diagnostic still checks Entra policies (checks 1 and 2) but cannot count SPO external users.
+
+### Interpreting Results
+
+**If `EnableAzureADB2BIntegration = True`:**
+Your tenant already uses Entra B2B for external sharing. Impact is minimal — only users who shared content before B2B integration was enabled and never re-authenticated could be affected. In most cases, no further action is needed.
+
+**If `EnableAzureADB2BIntegration = False` and SPO external users > 0:**
+You have at-risk users. Proceed to Step 2 for a detailed report, or enable B2B integration now:
 
 ```powershell
-.\Get-SPOOTPImpactAssessment.ps1 -TenantName 'contoso' -GraphOnly
+Set-SPOTenant -EnableAzureADB2BIntegration $true
 ```
 
-### Full scan with OneDrive sites and 90-day inactivity threshold
+**If Email OTP is disabled:**
+Enable it immediately in Entra admin center → External Identities → All identity providers → Email one-time passcode → **Yes**. Without this, guests without MSA/federation will be unable to authenticate after retirement.
 
-```powershell
-.\Get-SPOOTPImpactAssessment.ps1 -TenantName 'contoso' -InactiveDaysThreshold 90 -IncludeOneDriveSites
-```
+---
 
-### Pre-connect SPO manually (recommended if SPO auth fails)
+## Step 2: Full Assessment
+
+`Get-SPOOTPImpactAssessment.ps1` produces a detailed CSV report of all affected users. Run this only if the diagnostic (Step 1) indicates there are at-risk users.
+
+### Two Operating Modes
+
+| | SPO + Graph (default) | Graph-only (`-GraphOnly`) |
+|---|---|---|
+| **How it works** | Enumerates external users per SharePoint site via SPO Management Shell, cross-references with Entra B2B guest accounts | Analyzes Entra guest accounts by their identity type (`identities` array) |
+| **Data quality** | Full: per-site mapping, `WhenCreated`, site URLs/titles | Partial: identifies at-risk identity types, no per-site mapping |
+| **What it finds** | External users in SharePoint who have **no Entra B2B guest account** (true SPO OTP users) | Entra guests with `EmailOTP` identity type (already have B2B account but use email OTP auth) |
+| **Requires** | `Microsoft.Online.SharePoint.PowerShell` + SharePoint Admin role | Only `Microsoft.Graph.Authentication` |
+| **Estimated runtime** | **30 min – 2+ hours** depending on site count (progress logged every 50 sites) | **1–5 minutes** (queries Entra ID only, no site scanning) |
+| **Best for** | Production assessment with full per-site detail | Quick overview when SPO module auth is unavailable, or for very large tenants where per-site scanning is impractical |
+
+> **Important:** Graph-only mode cannot detect true SPO-only OTP users (those who exist only in SharePoint's external user store and have no Entra representation at all). For a complete picture, use SPO mode.
+
+If the SPO module fails to authenticate, the script **automatically falls back** to Graph-only mode and logs a warning.
+
+### Usage
+
+**SPO + Graph mode** (recommended — connect SPO first):
 
 ```powershell
 Connect-SPOService -Url 'https://contoso-admin.sharepoint.com'
 .\Get-SPOOTPImpactAssessment.ps1 -TenantName 'contoso'
 ```
 
-### Flexible tenant name input
+**SPO + Graph with OneDrive sites and 90-day threshold:**
 
-The `-TenantName` parameter accepts any of these formats:
-
-```
-contoso
-contoso.sharepoint.com
-https://contoso.sharepoint.com
-https://contoso-admin.sharepoint.com
-contoso.sharepoint.us          # sovereign clouds
+```powershell
+Connect-SPOService -Url 'https://contoso-admin.sharepoint.com'
+.\Get-SPOOTPImpactAssessment.ps1 -TenantName 'contoso' -InactiveDaysThreshold 90 -IncludeOneDriveSites
 ```
 
-## Parameters
+> Including OneDrive sites significantly increases runtime (can add thousands of sites to scan).
+
+**Graph-only mode** (no SPO module needed):
+
+```powershell
+.\Get-SPOOTPImpactAssessment.ps1 -TenantName 'contoso' -GraphOnly
+```
+
+### Parameters
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `-TenantName` | String | *(required)* | SharePoint tenant name or URL |
+| `-TenantName` | String | *(required)* | Tenant name or URL (`contoso`, `contoso.sharepoint.com`, `https://contoso-admin.sharepoint.com`) |
 | `-InactiveDaysThreshold` | Int | `180` | Days since last activity to flag as inactive (30–730) |
 | `-IncludeInactiveUsers` | Bool | `$true` | Include inactive users in report (flagged as LOW impact) |
-| `-OutputPath` | String | `SPO_OTP_Impact_<timestamp>.csv` | CSV output file path |
-| `-IncludeOneDriveSites` | Switch | `$false` | Include OneDrive for Business sites in scan |
-| `-GraphOnly` | Switch | `$false` | Use only Graph API (no SPO module required) |
+| `-OutputPath` | String | `SPO_OTP_Impact_<timestamp>.csv` | CSV report output path |
+| `-IncludeOneDriveSites` | Switch | `$false` | Include OneDrive for Business sites (increases runtime) |
+| `-GraphOnly` | Switch | `$false` | Use only Graph API, skip SPO module |
 
-## Output
+### Output
 
-### CSV Report Columns
+The script generates two files:
+
+```
+SPO_OTP_Impact_20260313_112804.csv   # Detailed report
+SPO_OTP_Impact_20260313_112804.log   # Full session log with diagnostics
+```
+
+**CSV columns:**
 
 | Column | Description |
 |--------|-------------|
 | `Email` | External user's email address |
 | `DisplayName` | Display name |
-| `InvitedAs` | Original invitation email |
-| `AcceptedAs` | Email used to accept the invitation |
-| `WhenCreated` | Account creation date (SPO mode only) |
+| `InvitedAs` / `AcceptedAs` | Invitation and acceptance email |
+| `WhenCreated` | Account creation date |
 | `IsActive` | Whether the user is considered active |
 | `LastActivityDate` | Last known activity date |
-| `ActivitySource` | Where the activity date came from (`Unified Audit Log`, `SPO WhenCreated`, etc.) |
-| `HasB2BAccount` | Always `False` (affected users by definition don't have one) |
-| `SiteCount` | Number of sites the user has access to |
-| `SiteUrls` | Semicolon-separated list of site URLs |
-| `SiteTitles` | Semicolon-separated list of site titles |
+| `ActivitySource` | Source: `Entra SignInActivity`, `Unified Audit Log`, `SPO WhenCreated`, `M365 SharePoint Usage Report` |
+| `IdentityType` | `EmailOTP` (at risk), `Federated` / `MicrosoftAccount` (safe), `Unknown` — Graph-only mode |
+| `ExternalUserState` | `Accepted`, `PendingAcceptance` |
+| `AccountEnabled` | Whether the Entra account is enabled |
+| `SiteCount` | Number of sites with access (SPO mode only) |
+| `SiteUrls` / `SiteTitles` | Sites the user can access (SPO mode only) |
 | `Impact` | `HIGH - Active user will lose access` or `LOW - Inactive account` |
 | `DataSource` | `SPO Module` or `Graph API` |
 
-### Console Summary
+---
 
-```
-==========================================
-         ASSESSMENT SUMMARY
-==========================================
-Mode:                                   SPO + Graph
-Total external users found:             142
-Already have B2B guest account (safe):  98
-Affected by SPO OTP retirement:         44
-  - Active (HIGH impact):               31
-  - Inactive (LOW impact):              13
-Sites with affected users:              17
-==========================================
-```
+## Remediation
 
-### Logging
+For users identified as **HIGH impact**:
 
-The script writes a persistent log file alongside the CSV output (`SPO_OTP_Impact_<timestamp>.log`). The log captures the full session including connection attempts, per-site scan results, progress checkpoints every 50 sites, and any errors. Useful for debugging long-running scans or sharing results with colleagues.
-
-```
-SPO_OTP_Impact_20260313_112804.csv   # Report
-SPO_OTP_Impact_20260313_112804.log   # Full session log
-```
-
-## Remediation Options
-
-For users identified as **HIGH impact**, you have several options before the July 2026 deadline:
-
-1. **Bulk invite via Entra admin center** — Create B2B guest accounts manually or via `New-MgInvitation`
-2. **Re-share content** — Have an internal user share or re-share at least one file/folder/site with the external user. This automatically creates a B2B guest account.
-3. **Enable Email OTP in Entra External ID** — Ensure email one-time passcode is **not disabled** in Entra External ID settings as a fallback authentication method. See [Email OTP for B2B guests](https://learn.microsoft.com/entra/external-id/one-time-passcode).
+1. **Enable B2B integration** (if not already):
+   ```powershell
+   Set-SPOTenant -EnableAzureADB2BIntegration $true
+   ```
+2. **Ensure Email OTP is enabled** in Entra admin center → External Identities → All identity providers → Email one-time passcode → **Yes**. See [Email OTP for B2B guests](https://learn.microsoft.com/entra/external-id/one-time-passcode).
+3. **Bulk invite** affected users via Entra admin center or `New-MgInvitation` to create B2B guest accounts proactively.
+4. **Re-share content** — have an internal user share or re-share at least one file/folder/site with the external user. This automatically creates a B2B guest account and restores access to all previously shared content.
+5. **Communicate** to internal users that some external collaborators may see Access Denied starting July 2026, and that re-sharing resolves it.
 
 ## Known Issues
 
 ### SPO Module Assembly Conflicts
 
-The `Microsoft.Online.SharePoint.PowerShell` module bundles its own version of `Microsoft.Graph.Authentication` assemblies. If you have `Microsoft.Graph.Users` or other Graph submodules loaded in the same session, you may see:
+The `Microsoft.Online.SharePoint.PowerShell` module bundles its own `Microsoft.Graph.Authentication` assemblies. Loading `Microsoft.Graph.Users` or other Graph submodules in the same session causes:
 
 ```
 Could not load file or assembly 'Microsoft.Graph.Authentication, Version=2.x.x.x'
 ```
 
-**This script avoids this by design** — it uses only `Invoke-MgGraphRequest` for all Graph calls and never imports `Microsoft.Graph.Users`.
+**Both scripts avoid this by design** — all Graph calls use `Invoke-MgGraphRequest` (REST only).
 
 ### SPO Module Auth Failures (400 Bad Request)
 
-Common with older SPO module versions or Conditional Access policies blocking legacy auth. Workarounds:
+Common with older SPO module versions or Conditional Access policies. Workarounds:
 
+- Pre-connect manually before running scripts: `Connect-SPOService -Url 'https://tenant-admin.sharepoint.com'`
 - Update the module: `Update-Module Microsoft.Online.SharePoint.PowerShell -Force`
-- Use `-GraphOnly` switch
-- Pre-connect manually: `Connect-SPOService -Url 'https://tenant-admin.sharepoint.com'`
+- Use `-GraphOnly` switch as fallback
 
-## Timeline Reference (MC1243549)
+### `Get-SPOExternalUser` Returns 0 with Parameters
+
+Some SPO module versions return 0 results when `-Position` and `-PageSize` parameters are used, but return data without parameters. The diagnostic script handles this by trying multiple retrieval methods automatically.
+
+## Timeline (MC1243549)
 
 | Date | Event |
 |------|-------|

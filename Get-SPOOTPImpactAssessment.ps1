@@ -346,16 +346,24 @@ function Connect-Services {
 }
 
 function Get-EntraGuestAccounts {
-    <# Retrieves all B2B guest accounts from Entra ID via Graph REST API. #>
+    <#
+    .SYNOPSIS
+        Retrieves all B2B guest accounts from Entra ID via Graph REST API.
+        Includes identity type classification for SPO OTP impact analysis.
+    .OUTPUTS
+        Hashtable keyed by email (lowercase) with guest info objects.
+        Also sets $script:AllGuestsList with full list for Graph-only analysis.
+    #>
     [CmdletBinding()]
     param()
 
-    Write-Log 'Retrieving Entra ID B2B guest accounts...'
+    Write-Log 'Retrieving Entra ID guest accounts with identity classification...'
     $guests = @{}
+    $script:AllGuestsList = [System.Collections.Generic.List[object]]::new()
     $count = 0
 
     try {
-        $select = 'id,displayName,mail,otherMails,userPrincipalName,createdDateTime,signInActivity,accountEnabled,externalUserState'
+        $select = 'id,displayName,mail,otherMails,userPrincipalName,createdDateTime,signInActivity,accountEnabled,externalUserState,identities,creationType'
         $uri = "v1.0/users?`$filter=userType eq 'Guest'&`$select=$select&`$top=999&`$count=true"
 
         do {
@@ -392,16 +400,62 @@ function Get-EntraGuestAccounts {
                     }
                 }
 
+                # Classify identity type from identities array
+                $identityType = 'Unknown'
+                $identityIssuer = ''
+                $hasFederatedIdentity = $false
+                $hasEmailOTPIdentity = $false
+                $hasMSAIdentity = $false
+
+                if ($g.identities) {
+                    foreach ($ident in $g.identities) {
+                        $signInType = $ident.signInType
+                        $issuer = $ident.issuer
+
+                        if ($signInType -eq 'federated') {
+                            $hasFederatedIdentity = $true
+                            $identityIssuer = $issuer
+                        }
+                        elseif ($signInType -eq 'emailAddress') {
+                            $hasEmailOTPIdentity = $true
+                        }
+                        elseif ($signInType -eq 'userName' -and $issuer -eq 'MicrosoftAccount') {
+                            $hasMSAIdentity = $true
+                        }
+                    }
+                }
+
+                # Classification priority:
+                # Federated = user has an external IdP (Azure AD, Google, etc.) -> proper B2B
+                # MSA = Microsoft Account -> proper B2B
+                # EmailOTP = email address only, no IdP -> SPO OTP / Email OTP pattern (at risk)
+                # Unknown = no identities data
+                if ($hasFederatedIdentity) {
+                    $identityType = 'Federated'
+                }
+                elseif ($hasMSAIdentity) {
+                    $identityType = 'MicrosoftAccount'
+                }
+                elseif ($hasEmailOTPIdentity) {
+                    $identityType = 'EmailOTP'
+                }
+
                 $info = [PSCustomObject]@{
                     Id                = $g.id
                     DisplayName       = $g.displayName
                     Mail              = $g.mail
+                    Emails            = ($emails | Select-Object -Unique)
                     UPN               = $g.userPrincipalName
                     AccountEnabled    = $g.accountEnabled
                     ExternalUserState = $g.externalUserState
                     CreatedDateTime   = $g.createdDateTime
+                    CreationType      = $g.creationType
                     LastSignIn        = $lastSignIn
+                    IdentityType      = $identityType
+                    IdentityIssuer    = $identityIssuer
                 }
+
+                $script:AllGuestsList.Add($info)
 
                 foreach ($e in ($emails | Select-Object -Unique)) {
                     $guests[$e] = $info
@@ -411,7 +465,17 @@ function Get-EntraGuestAccounts {
             $uri = $response.'@odata.nextLink'
         } while ($uri)
 
-        Write-Log "Found $count Entra B2B guest accounts." -Level Success
+        # Log identity type distribution
+        $fedCount = ($script:AllGuestsList | Where-Object { $_.IdentityType -eq 'Federated' }).Count
+        $msaCount = ($script:AllGuestsList | Where-Object { $_.IdentityType -eq 'MicrosoftAccount' }).Count
+        $otpCount = ($script:AllGuestsList | Where-Object { $_.IdentityType -eq 'EmailOTP' }).Count
+        $unkCount = ($script:AllGuestsList | Where-Object { $_.IdentityType -eq 'Unknown' }).Count
+
+        Write-Log "Found $count Entra guest accounts:" -Level Success
+        Write-Log "  Federated (external IdP):     $fedCount  -> Safe, proper B2B"
+        Write-Log "  Microsoft Account (MSA):      $msaCount  -> Safe, proper B2B"
+        Write-Log "  Email OTP only:               $otpCount  -> AT RISK (SPO OTP pattern)"
+        Write-Log "  Unknown identity:             $unkCount  -> Needs review"
     }
     catch {
         Write-Log "Error retrieving guest accounts: $($_.Exception.Message)" -Level Error
@@ -419,6 +483,154 @@ function Get-EntraGuestAccounts {
     }
 
     return $guests
+}
+
+function Get-AtRiskGuestsGraphOnly {
+    <#
+    .SYNOPSIS
+        Graph-only mode: Identifies at-risk guests directly from Entra identity classification.
+        Replaces the broken per-site permissions scanning approach.
+    .DESCRIPTION
+        At-risk guests are those with EmailOTP or Unknown identity type.
+        These users likely authenticate via SPO OTP and will lose access after July 2026.
+        Optionally enriches with SharePoint activity data from M365 reports.
+    #>
+    [CmdletBinding()]
+    param(
+        [datetime]$ActivityCutoff
+    )
+
+    Write-Log 'Analyzing Entra guests for SPO OTP risk (Graph-only mode)...'
+
+    $atRiskGuests = @{}
+    $safeCount = 0
+    $atRiskCount = 0
+
+    foreach ($guest in $script:AllGuestsList) {
+        # Federated and MSA guests have proper B2B identity -> safe
+        if ($guest.IdentityType -eq 'Federated' -or $guest.IdentityType -eq 'MicrosoftAccount') {
+            $safeCount++
+            continue
+        }
+
+        # EmailOTP and Unknown identity type -> at risk
+        $atRiskCount++
+        $email = if ($guest.Mail) { $guest.Mail.ToLower() } else { '' }
+        if (-not $email -and $guest.Emails -and $guest.Emails.Count -gt 0) {
+            $email = $guest.Emails[0]
+        }
+        if (-not $email) { continue }
+
+        # Determine activity
+        $isActive = $true
+        $lastActivity = $null
+        $activitySource = 'No sign-in data (assumed active)'
+
+        if ($guest.LastSignIn) {
+            $lastActivity = $guest.LastSignIn
+            $activitySource = 'Entra SignInActivity'
+            $isActive = $lastActivity -ge $ActivityCutoff
+        }
+        elseif ($guest.CreatedDateTime) {
+            try {
+                $created = [datetime]$guest.CreatedDateTime
+                $lastActivity = $created
+                $activitySource = 'Entra CreatedDateTime'
+                $isActive = $created -ge $ActivityCutoff
+            }
+            catch { }
+        }
+
+        $atRiskGuests[$email] = @{
+            Email            = $email
+            DisplayName      = $guest.DisplayName
+            InvitedAs        = $email
+            AcceptedAs       = $email
+            WhenCreated      = $guest.CreatedDateTime
+            IsActive         = $isActive
+            LastActivityDate = $lastActivity
+            ActivitySource   = $activitySource
+            IdentityType     = $guest.IdentityType
+            ExternalUserState = $guest.ExternalUserState
+            CreationType     = $guest.CreationType
+            AccountEnabled   = $guest.AccountEnabled
+            Sites            = [System.Collections.Generic.List[string]]::new()
+            SiteTitles       = [System.Collections.Generic.List[string]]::new()
+        }
+    }
+
+    Write-Log "Identity analysis complete: $safeCount safe (Federated/MSA), $atRiskCount at-risk (EmailOTP/Unknown)." -Level Success
+
+    # Try to enrich with SharePoint activity from M365 reports
+    Write-Log 'Attempting to map at-risk users to SharePoint sites via usage reports...'
+    $mappedUsers = 0
+
+    try {
+        # getSharePointActivityUserDetail returns per-user SPO activity
+        $reportUri = "v1.0/reports/getSharePointActivityUserDetail(period='D180')"
+        $reportResponse = Invoke-MgGraphRequest -Method GET -Uri $reportUri -ErrorAction Stop
+
+        # Response is CSV text
+        if ($reportResponse -is [string]) {
+            $reportLines = $reportResponse -split "`n" | Where-Object { $_.Trim() }
+        }
+        elseif ($reportResponse.'@odata.context') {
+            # JSON response with value array
+            $reportLines = $null
+        }
+        else {
+            $reportLines = $null
+        }
+
+        if ($reportLines -and $reportLines.Count -gt 1) {
+            # Parse CSV header
+            $header = ($reportLines[0] -split ',') | ForEach-Object { $_.Trim('"', ' ') }
+            $upnIndex = [array]::IndexOf($header, 'User Principal Name')
+            $lastActivityIndex = [array]::IndexOf($header, 'Last Activity Date')
+            $visitedIndex = [array]::IndexOf($header, 'Visited Page Count')
+
+            if ($upnIndex -ge 0) {
+                for ($i = 1; $i -lt $reportLines.Count; $i++) {
+                    $fields = ($reportLines[$i] -split ',') | ForEach-Object { $_.Trim('"', ' ') }
+                    if ($fields.Count -le $upnIndex) { continue }
+
+                    $reportUpn = $fields[$upnIndex].ToLower()
+                    # Check if this UPN matches any at-risk guest
+                    foreach ($email in $atRiskGuests.Keys) {
+                        if ($reportUpn -like "*$email*" -or $reportUpn -like "*$($email -replace '@','_')*") {
+                            # Update activity from report
+                            if ($lastActivityIndex -ge 0 -and $fields.Count -gt $lastActivityIndex -and $fields[$lastActivityIndex]) {
+                                try {
+                                    $reportDate = [datetime]$fields[$lastActivityIndex]
+                                    if ($null -eq $atRiskGuests[$email].LastActivityDate -or $reportDate -gt $atRiskGuests[$email].LastActivityDate) {
+                                        $atRiskGuests[$email].LastActivityDate = $reportDate
+                                        $atRiskGuests[$email].ActivitySource = 'M365 SharePoint Usage Report'
+                                        $atRiskGuests[$email].IsActive = $reportDate -ge $ActivityCutoff
+                                    }
+                                }
+                                catch { }
+                            }
+                            $mappedUsers++
+                            break
+                        }
+                    }
+                }
+            }
+        }
+
+        if ($mappedUsers -gt 0) {
+            Write-Log "Enriched $mappedUsers users from SharePoint usage reports." -Level Success
+        }
+        else {
+            Write-Log 'No matches in SharePoint usage reports (report may be anonymized or empty).' -Level Warning
+        }
+    }
+    catch {
+        Write-Log "SharePoint usage report not available: $($_.Exception.Message)" -Level Warning
+        Write-Log 'Site mapping will not be available in Graph-only mode.' -Level Warning
+    }
+
+    return $atRiskGuests
 }
 
 function Get-SitesSPO {
@@ -654,133 +866,155 @@ try {
         Write-Log 'Per-site external user data may be less detailed than SPO mode.' -Level Warning
     }
 
-    # Step 3: Get all Entra B2B guest accounts (safe users)
-    Write-Log '--- Step 3: Entra B2B guest accounts ---'
+    # Step 3: Get all Entra guest accounts with identity classification
+    Write-Log '--- Step 3: Entra guest accounts ---'
     $entraGuests = Get-EntraGuestAccounts
 
-    # Step 4: Get all sites
-    Write-Log '--- Step 4: Enumerating sites ---'
-    if ($effectiveGraphOnly) {
-        $sites = Get-SitesGraph -IncludeOneDrive:$IncludeOneDriveSites
-    }
-    else {
-        $sites = Get-SitesSPO -IncludeOneDrive:$IncludeOneDriveSites
-    }
-
-    # Step 5: Enumerate external users per site
-    Write-Log '--- Step 5: Scanning sites for external users ---'
     $affectedUsers = @{}
     $totalExternal = 0
     $alreadyB2B = 0
-    $noEmailCount = 0
-    $sitesWithExtUsers = 0
-    $sitesScanned = 0
-    $siteIndex = 0
 
-    foreach ($site in $sites) {
-        $siteIndex++
-        $sitesScanned++
-        $pct = [math]::Round(($siteIndex / $sites.Count) * 100, 1)
-        Write-Progress -Activity 'Scanning sites for external users' -Status "$siteIndex / $($sites.Count) - $($site.Url)" -PercentComplete $pct
+    if ($effectiveGraphOnly) {
+        # =====================================================================
+        # GRAPH-ONLY MODE: Analyze Entra guests by identity type
+        # EmailOTP/Unknown identity = at-risk (SPO OTP authentication pattern)
+        # Federated/MSA identity = safe (proper B2B)
+        # =====================================================================
+        Write-Log ''
+        Write-Log '--- Step 4: Analyzing guests by identity type (Graph-only) ---'
+        Write-Log 'Skipping per-site scanning (Graph permissions API does not return SPO sharing data).'
+        Write-Log 'Using Entra identity classification instead.'
+        Write-Log ''
 
-        if ($effectiveGraphOnly) {
-            $siteExternalUsers = Get-ExternalUsersGraph -SiteUrl $site.Url -SiteId $site.SiteId
-        }
-        else {
-            $siteExternalUsers = Get-ExternalUsersSPO -SiteUrl $site.Url
-        }
+        $affectedUsers = Get-AtRiskGuestsGraphOnly -ActivityCutoff $activityCutoffDate
 
-        $siteExtCount = 0
-        $siteB2BCount = 0
-        $siteAffectedCount = 0
+        $totalExternal = $script:AllGuestsList.Count
+        $alreadyB2B = $totalExternal - $affectedUsers.Count
 
-        foreach ($ext in $siteExternalUsers) {
-            $totalExternal++
-            $siteExtCount++
-            $email = Coalesce $ext.Email $ext.AcceptedAs $ext.InvitedAs
-            if (-not $email) {
-                $noEmailCount++
-                Write-Log "External user with no email on $($site.Url) - $($ext.DisplayName)" -Level Warning
-                continue
-            }
-            $email = $email.ToLower().Trim()
-
-            # Check if user has a B2B guest account
-            $hasB2B = $entraGuests.ContainsKey($email)
-            if (-not $hasB2B -and $ext.AcceptedAs) {
-                $hasB2B = $entraGuests.ContainsKey($ext.AcceptedAs.ToLower().Trim())
-            }
-            if (-not $hasB2B -and $ext.InvitedAs) {
-                $hasB2B = $entraGuests.ContainsKey($ext.InvitedAs.ToLower().Trim())
-            }
-
-            if ($hasB2B) {
-                $alreadyB2B++
-                $siteB2BCount++
-                continue
-            }
-
-            # Affected user - accumulate sites
-            $siteAffectedCount++
-            if ($affectedUsers.ContainsKey($email)) {
-                $existingSites = $affectedUsers[$email].Sites
-                if ($existingSites -notcontains $site.Url) {
-                    $affectedUsers[$email].Sites += $site.Url
-                    $affectedUsers[$email].SiteTitles += $site.Title
-                }
-            }
-            else {
-                # Determine activity status
-                $isActive = $true
-                $lastActivity = $null
-                $activitySource = 'No data (assumed active)'
-
-                if ($ext.WhenCreated) {
-                    try {
-                        $lastActivity = [datetime]$ext.WhenCreated
-                        $activitySource = 'SPO WhenCreated'
-                        $isActive = $lastActivity -ge $activityCutoffDate
-                    }
-                    catch { }
-                }
-
-                $affectedUsers[$email] = @{
-                    Email            = $email
-                    DisplayName      = $ext.DisplayName
-                    InvitedAs        = $ext.InvitedAs
-                    AcceptedAs       = $ext.AcceptedAs
-                    WhenCreated      = $ext.WhenCreated
-                    IsActive         = $isActive
-                    LastActivityDate = $lastActivity
-                    ActivitySource   = $activitySource
-                    Sites            = [System.Collections.Generic.List[string]]@($site.Url)
-                    SiteTitles       = [System.Collections.Generic.List[string]]@($site.Title)
-                }
-            }
-        }
-
-        if ($siteExtCount -gt 0) {
-            $sitesWithExtUsers++
-            Write-Log "  $($site.Url) - ext: $siteExtCount, B2B: $siteB2BCount, affected: $siteAffectedCount"
-        }
-
-        # Progress summary every 50 sites
-        if ($siteIndex % 50 -eq 0) {
-            Write-Log "  [Progress] $siteIndex/$($sites.Count) sites scanned | ext: $totalExternal | B2B: $alreadyB2B | affected: $($affectedUsers.Count) | no-email: $noEmailCount"
-        }
+        Write-Log ''
+        Write-Log '--- Step 4: Analysis complete ---'
+        Write-Log "  Total Entra guests:            $totalExternal"
+        Write-Log "  Safe (Federated/MSA):          $alreadyB2B"
+        Write-Log "  At-risk (EmailOTP/Unknown):    $($affectedUsers.Count)"
+        Write-Log ''
+        Write-Log 'NOTE: Site-level mapping is not available in Graph-only mode.' -Level Warning
+        Write-Log 'To get per-site data, connect SPO module manually before running:' -Level Warning
+        Write-Log "  Connect-SPOService -Url '$spoAdminUrl'" -Level Warning
+        Write-Log ''
     }
-    Write-Progress -Activity 'Scanning sites for external users' -Completed
+    else {
+        # =====================================================================
+        # SPO MODE: Per-site external user scanning + Entra cross-reference
+        # =====================================================================
 
-    # Step 5 diagnostic summary
-    Write-Log ''
-    Write-Log '--- Step 5: Scan complete ---'
-    Write-Log "  Sites scanned:                 $sitesScanned"
-    Write-Log "  Sites with external users:     $sitesWithExtUsers"
-    Write-Log "  Total external user entries:    $totalExternal"
-    Write-Log "  Matched to B2B guest account:  $alreadyB2B"
-    Write-Log "  No email (skipped):            $noEmailCount"
-    Write-Log "  Unique affected users:         $($affectedUsers.Count)"
-    Write-Log ''
+        # Step 4: Get all sites
+        Write-Log '--- Step 4: Enumerating sites ---'
+        $sites = Get-SitesSPO -IncludeOneDrive:$IncludeOneDriveSites
+
+        # Step 5: Enumerate external users per site
+        Write-Log '--- Step 5: Scanning sites for external users ---'
+        $noEmailCount = 0
+        $sitesWithExtUsers = 0
+        $sitesScanned = 0
+        $siteIndex = 0
+
+        foreach ($site in $sites) {
+            $siteIndex++
+            $sitesScanned++
+            $pct = [math]::Round(($siteIndex / $sites.Count) * 100, 1)
+            Write-Progress -Activity 'Scanning sites for external users' -Status "$siteIndex / $($sites.Count) - $($site.Url)" -PercentComplete $pct
+
+            $siteExternalUsers = Get-ExternalUsersSPO -SiteUrl $site.Url
+
+            $siteExtCount = 0
+            $siteB2BCount = 0
+            $siteAffectedCount = 0
+
+            foreach ($ext in $siteExternalUsers) {
+                $totalExternal++
+                $siteExtCount++
+                $email = Coalesce $ext.Email $ext.AcceptedAs $ext.InvitedAs
+                if (-not $email) {
+                    $noEmailCount++
+                    Write-Log "External user with no email on $($site.Url) - $($ext.DisplayName)" -Level Warning
+                    continue
+                }
+                $email = $email.ToLower().Trim()
+
+                # Check if user has a B2B guest account
+                $hasB2B = $entraGuests.ContainsKey($email)
+                if (-not $hasB2B -and $ext.AcceptedAs) {
+                    $hasB2B = $entraGuests.ContainsKey($ext.AcceptedAs.ToLower().Trim())
+                }
+                if (-not $hasB2B -and $ext.InvitedAs) {
+                    $hasB2B = $entraGuests.ContainsKey($ext.InvitedAs.ToLower().Trim())
+                }
+
+                if ($hasB2B) {
+                    $alreadyB2B++
+                    $siteB2BCount++
+                    continue
+                }
+
+                # Affected user - accumulate sites
+                $siteAffectedCount++
+                if ($affectedUsers.ContainsKey($email)) {
+                    $existingSites = $affectedUsers[$email].Sites
+                    if ($existingSites -notcontains $site.Url) {
+                        $affectedUsers[$email].Sites += $site.Url
+                        $affectedUsers[$email].SiteTitles += $site.Title
+                    }
+                }
+                else {
+                    $isActive = $true
+                    $lastActivity = $null
+                    $activitySource = 'No data (assumed active)'
+
+                    if ($ext.WhenCreated) {
+                        try {
+                            $lastActivity = [datetime]$ext.WhenCreated
+                            $activitySource = 'SPO WhenCreated'
+                            $isActive = $lastActivity -ge $activityCutoffDate
+                        }
+                        catch { }
+                    }
+
+                    $affectedUsers[$email] = @{
+                        Email            = $email
+                        DisplayName      = $ext.DisplayName
+                        InvitedAs        = $ext.InvitedAs
+                        AcceptedAs       = $ext.AcceptedAs
+                        WhenCreated      = $ext.WhenCreated
+                        IsActive         = $isActive
+                        LastActivityDate = $lastActivity
+                        ActivitySource   = $activitySource
+                        Sites            = [System.Collections.Generic.List[string]]@($site.Url)
+                        SiteTitles       = [System.Collections.Generic.List[string]]@($site.Title)
+                    }
+                }
+            }
+
+            if ($siteExtCount -gt 0) {
+                $sitesWithExtUsers++
+                Write-Log "  $($site.Url) - ext: $siteExtCount, B2B: $siteB2BCount, affected: $siteAffectedCount"
+            }
+
+            if ($siteIndex % 50 -eq 0) {
+                Write-Log "  [Progress] $siteIndex/$($sites.Count) sites | ext: $totalExternal | B2B: $alreadyB2B | affected: $($affectedUsers.Count)"
+            }
+        }
+        Write-Progress -Activity 'Scanning sites for external users' -Completed
+
+        Write-Log ''
+        Write-Log '--- Step 5: Scan complete ---'
+        Write-Log "  Sites scanned:                 $sitesScanned"
+        Write-Log "  Sites with external users:     $sitesWithExtUsers"
+        Write-Log "  Total external user entries:    $totalExternal"
+        Write-Log "  Matched to B2B guest account:  $alreadyB2B"
+        Write-Log "  No email (skipped):            $noEmailCount"
+        Write-Log "  Unique affected users:         $($affectedUsers.Count)"
+        Write-Log ''
+    }
 
     # Step 6: Enrich with Unified Audit Log (best-effort)
     Write-Log '--- Step 6: Enriching activity data ---'
@@ -835,20 +1069,23 @@ try {
         if ($effectiveGraphOnly) { $modeText = 'Graph API' }
 
         $reportRows += [PSCustomObject]@{
-            Email            = $u.Email
-            DisplayName      = $u.DisplayName
-            InvitedAs        = $u.InvitedAs
-            AcceptedAs       = $u.AcceptedAs
-            WhenCreated      = $u.WhenCreated
-            IsActive         = $u.IsActive
-            LastActivityDate = $lastDateStr
-            ActivitySource   = $u.ActivitySource
-            HasB2BAccount    = $false
-            SiteCount        = $u.Sites.Count
-            SiteUrls         = ($u.Sites | Select-Object -Unique) -join '; '
-            SiteTitles       = ($u.SiteTitles | Select-Object -Unique) -join '; '
-            Impact           = $impactText
-            DataSource       = $modeText
+            Email              = $u.Email
+            DisplayName        = $u.DisplayName
+            InvitedAs          = $u.InvitedAs
+            AcceptedAs         = $u.AcceptedAs
+            WhenCreated        = $u.WhenCreated
+            IsActive           = $u.IsActive
+            LastActivityDate   = $lastDateStr
+            ActivitySource     = $u.ActivitySource
+            IdentityType       = if ($u.IdentityType) { $u.IdentityType } else { 'N/A (SPO mode)' }
+            ExternalUserState  = if ($u.ExternalUserState) { $u.ExternalUserState } else { '' }
+            AccountEnabled     = if ($null -ne $u.AccountEnabled) { $u.AccountEnabled } else { '' }
+            HasB2BAccount      = $false
+            SiteCount          = $u.Sites.Count
+            SiteUrls           = ($u.Sites | Select-Object -Unique) -join '; '
+            SiteTitles         = ($u.SiteTitles | Select-Object -Unique) -join '; '
+            Impact             = $impactText
+            DataSource         = $modeText
         }
     }
 
