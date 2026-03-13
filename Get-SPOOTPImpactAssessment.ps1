@@ -52,12 +52,34 @@
 
 .NOTES
     Author:         Petr Beloch
+    Version:        3.1
     Date:           2026-03-13
     Reference:      MC1243549 - Retirement of SharePoint OTP
     Modules:        Microsoft.Graph.Authentication (required)
                     Microsoft.Online.SharePoint.PowerShell (optional, used when -GraphOnly is not set)
     Permissions:    SharePoint Administrator (for SPO mode), Global Reader or equivalent
     Graph Scopes:   User.Read.All, AuditLog.Read.All, Sites.Read.All
+
+    CHANGELOG:
+    v3.1 (2026-03-13)
+        - Added file logging (append .log alongside CSV output)
+        - Fixed Write-Log crash on empty string (PS 5.1 [Mandatory] + empty validation)
+        - Added ExchangeOnlineManagement module auto-loading and Connect-ExchangeOnline
+          for Unified Audit Log enrichment (Search-UnifiedAuditLog requires EXO session)
+        - Added per-site diagnostic counters in Step 5 (ext/B2B/affected per site)
+        - Added progress summary every 50 sites to log
+        - Graph-only mode: replaced broken sites/permissions API scanning with
+          Entra identity classification (identities array analysis)
+        - Graph-only mode: added M365 SharePoint usage report enrichment
+        - Added IdentityType, ExternalUserState, AccountEnabled to CSV output
+    v3.0 (2026-03-13)
+        - Complete rewrite for PS 5.1 compatibility (removed ?? operator, ternary)
+        - Replaced Get-MgUser with Invoke-MgGraphRequest (REST) to avoid assembly
+          conflicts with SPO module's bundled Graph assemblies
+        - Added -GraphOnly switch with automatic fallback when SPO auth fails
+        - Multi-strategy SPO connection (standard, -Browser, auto-fallback)
+        - Flexible TenantName parsing (URL, admin URL, bare name, sovereign clouds)
+        - Removed #Requires -Modules to prevent assembly load conflicts at startup
 #>
 
 [CmdletBinding()]

@@ -13,9 +13,23 @@
 
 .NOTES
     Author:  Petr Beloch
+    Version: 3.1
+    Date:    2026-03-13
     Modules: Microsoft.Graph.Authentication (required)
              Microsoft.Online.SharePoint.PowerShell (required for full check)
     Scopes:  Policy.Read.All, User.Read.All, IdentityProvider.Read.All
+
+    CHANGELOG:
+    v3.1 (2026-03-13)
+        - Added IdentityProvider.Read.All scope (fixes Forbidden on identity providers list)
+        - Suppressed verbose Graph context output on reconnect
+        - Added bare Get-SPOExternalUser call (Method 1) to work around SPO module
+          paging bug where -Position/-PageSize returns 0 results
+        - Added SharingCapability analysis (Disabled/ExistingOnly/ExternalUser/Anyone)
+        - 3-method fallback for external user retrieval (bare → paginated → site sampling)
+    v3.0 (2026-03-13)
+        - Initial release: Entra Email OTP policy check, B2B integration check,
+          identity providers, SPO external user cross-reference
 #>
 
 [CmdletBinding()]

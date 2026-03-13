@@ -1,4 +1,4 @@
-# SPO OTP Retirement Impact Assessment
+# SPO OTP Retirement Impact Assessment v3.1
 
 Toolset for assessing the impact of **SharePoint One-Time Passcode (SPO OTP) retirement** ([MC1243549](https://mc.merill.net/message/MC1243549)) on your Microsoft 365 tenant.
 
@@ -227,6 +227,44 @@ Some SPO module versions return 0 results when `-Position` and `-PageSize` param
 | **May 2026** | New external sharing starts using Entra B2B. Existing SPO OTP users keep access. |
 | **July 2026** | SPO OTP retirement begins. Users without B2B guest accounts get **Access Denied**. |
 | **August 31, 2026** | Retirement expected to complete. |
+
+## Changelog
+
+### v3.1 (2026-03-13)
+
+**Test-SPOOTPDiagnostic.ps1:**
+- Added `IdentityProvider.Read.All` scope (fixes `Forbidden` on identity providers endpoint)
+- Fixed verbose Graph context dump on reconnect
+- Added bare `Get-SPOExternalUser` call (Method 1) — workaround for SPO module paging bug where `-Position`/`-PageSize` returns 0 results
+- Added `SharingCapability` analysis with per-value explanation
+- 3-method fallback for external user retrieval: bare → paginated → site sampling
+
+**Get-SPOOTPImpactAssessment.ps1:**
+- Added persistent file logging (`.log` alongside `.csv` output)
+- Fixed `Write-Log` crash on empty string (`[Mandatory]` + empty validation in PS 5.1)
+- Added `ExchangeOnlineManagement` module auto-loading and `Connect-ExchangeOnline` for Unified Audit Log enrichment (`Search-UnifiedAuditLog` requires active EXO session)
+- Added per-site diagnostic counters (external/B2B/affected per site) in scan log
+- Added progress summary every 50 sites
+- Graph-only mode: replaced broken `sites/{id}/permissions` API scanning with Entra identity classification (`identities` array analysis)
+- Graph-only mode: added M365 SharePoint usage report enrichment for activity data
+- Added `IdentityType`, `ExternalUserState`, `AccountEnabled` columns to CSV output
+
+**README.md:**
+- Complete rewrite with diagnostic-first workflow (Step 1 → Step 2)
+- Added SPO OTP vs Entra B2B Email OTP background explanation
+- Added SPO vs Graph-only mode comparison table with runtime estimates
+- Added `SharingCapability` and `EnableAzureADB2BIntegration` interpretation guide
+- Documented `Get-SPOExternalUser` paging bug workaround
+
+### v3.0 (2026-03-13)
+
+- Complete rewrite of `Get-SPOOTPImpactAssessment.ps1` for PowerShell 5.1 compatibility (removed `??`, ternary operators)
+- Replaced `Get-MgUser` with `Invoke-MgGraphRequest` (REST) to avoid assembly conflicts with SPO module's bundled Graph assemblies
+- Added `-GraphOnly` switch with automatic fallback when SPO authentication fails
+- Multi-strategy SPO connection (standard → `-Browser` → auto-fallback to Graph-only)
+- Flexible `-TenantName` parsing (URL, admin URL, bare name, sovereign clouds)
+- Removed `#Requires -Modules` to prevent assembly load conflicts at startup
+- Initial release of `Test-SPOOTPDiagnostic.ps1`
 
 ## License
 
