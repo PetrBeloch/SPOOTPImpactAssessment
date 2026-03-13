@@ -31,6 +31,7 @@ If SPO module authentication fails, the script **automatically falls back** to G
 |--------|----------|---------|
 | `Microsoft.Graph.Authentication` | **Yes** | All Entra ID / Graph API queries |
 | `Microsoft.Online.SharePoint.PowerShell` | No (recommended) | SPO site/external user enumeration |
+| `ExchangeOnlineManagement` | No (recommended) | Unified Audit Log enrichment for accurate last-activity dates |
 
 > **Note:** `Microsoft.Graph.Users` and `Microsoft.Graph.Reports` are intentionally **not used**. The SPO module bundles its own version of Graph assemblies, causing version conflicts. All Graph queries use `Invoke-MgGraphRequest` (REST) instead.
 
@@ -53,6 +54,7 @@ If SPO module authentication fails, the script **automatically falls back** to G
 # Install required modules (if not already present)
 Install-Module Microsoft.Graph.Authentication -Scope CurrentUser
 Install-Module Microsoft.Online.SharePoint.PowerShell -Scope CurrentUser  # optional
+Install-Module ExchangeOnlineManagement -Scope CurrentUser                # optional, for audit log
 
 # Clone or download the script
 git clone https://github.com/yourrepo/Get-SPOOTPImpactAssessment.git
@@ -143,6 +145,15 @@ Affected by SPO OTP retirement:         44
   - Inactive (LOW impact):              13
 Sites with affected users:              17
 ==========================================
+```
+
+### Logging
+
+The script writes a persistent log file alongside the CSV output (`SPO_OTP_Impact_<timestamp>.log`). The log captures the full session including connection attempts, per-site scan results, progress checkpoints every 50 sites, and any errors. Useful for debugging long-running scans or sharing results with colleagues.
+
+```
+SPO_OTP_Impact_20260313_112804.csv   # Report
+SPO_OTP_Impact_20260313_112804.log   # Full session log
 ```
 
 ## Remediation Options

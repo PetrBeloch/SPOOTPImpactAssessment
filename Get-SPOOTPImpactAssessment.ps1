@@ -114,25 +114,47 @@ if (-not $OutputPath) {
     $scriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
     $OutputPath = Join-Path -Path $scriptDir -ChildPath "SPO_OTP_Impact_$timestamp.csv"
 }
+
+# Log file - same location as CSV, always appends
+$script:LogPath = [System.IO.Path]::ChangeExtension($OutputPath, '.log')
 #endregion
 
 #region Helper Functions
 function Write-Log {
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory)]
-        [string]$Message,
+        [Parameter(Mandatory = $false)]
+        [AllowEmptyString()]
+        [string]$Message = '',
 
         [ValidateSet('Info', 'Warning', 'Error', 'Success')]
         [string]$Level = 'Info'
     )
 
     $ts = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+
+    if ([string]::IsNullOrEmpty($Message)) {
+        # Empty line - console only
+        Write-Host ''
+        return
+    }
+
+    $line = "[$ts] [$Level] $Message"
+
+    # Console output with color
     switch ($Level) {
-        'Info'    { Write-Host "[$ts] [Info] $Message" -ForegroundColor Cyan }
-        'Warning' { Write-Host "[$ts] [Warning] $Message" -ForegroundColor Yellow }
-        'Error'   { Write-Host "[$ts] [Error] $Message" -ForegroundColor Red }
-        'Success' { Write-Host "[$ts] [Success] $Message" -ForegroundColor Green }
+        'Info'    { Write-Host $line -ForegroundColor Cyan }
+        'Warning' { Write-Host $line -ForegroundColor Yellow }
+        'Error'   { Write-Host $line -ForegroundColor Red }
+        'Success' { Write-Host $line -ForegroundColor Green }
+    }
+
+    # Append to log file
+    if ($script:LogPath) {
+        try {
+            $line | Out-File -FilePath $script:LogPath -Append -Encoding UTF8 -ErrorAction SilentlyContinue
+        }
+        catch { }
     }
 }
 
@@ -188,6 +210,26 @@ function Initialize-Modules {
 
     if (-not (Get-Command -Name 'Invoke-MgGraphRequest' -ErrorAction SilentlyContinue)) {
         throw 'Invoke-MgGraphRequest not available. Graph module may not be loaded correctly.'
+    }
+
+    # Load ExchangeOnlineManagement for Unified Audit Log enrichment (optional)
+    if (-not (Get-Command -Name 'Search-UnifiedAuditLog' -ErrorAction SilentlyContinue)) {
+        $exoMod = Get-Module -Name 'ExchangeOnlineManagement' -ListAvailable -ErrorAction SilentlyContinue |
+            Sort-Object Version -Descending | Select-Object -First 1
+        if ($exoMod) {
+            try {
+                Import-Module -Name 'ExchangeOnlineManagement' -ErrorAction Stop
+                Write-Log "Loaded ExchangeOnlineManagement v$($exoMod.Version)." -Level Success
+            }
+            catch {
+                Write-Log "Cannot load ExchangeOnlineManagement: $($_.Exception.Message)" -Level Warning
+                Write-Log 'Audit log enrichment will be skipped.' -Level Warning
+            }
+        }
+        else {
+            Write-Log 'ExchangeOnlineManagement not installed. Audit log enrichment will be skipped.' -Level Warning
+            Write-Log 'Install with: Install-Module ExchangeOnlineManagement -Scope CurrentUser' -Level Warning
+        }
     }
 }
 
@@ -281,6 +323,24 @@ function Connect-Services {
         catch {
             Write-Log "Graph connection failed: $($_.Exception.Message)" -Level Error
             throw
+        }
+    }
+
+    # --- Exchange Online (for Unified Audit Log) ---
+    if (Get-Command -Name 'Connect-ExchangeOnline' -ErrorAction SilentlyContinue) {
+        if (-not (Get-Command -Name 'Search-UnifiedAuditLog' -ErrorAction SilentlyContinue)) {
+            Write-Log 'Connecting to Exchange Online (for audit log enrichment)...'
+            try {
+                Connect-ExchangeOnline -ShowBanner:$false -ErrorAction Stop
+                Write-Log 'EXO: Connected.' -Level Success
+            }
+            catch {
+                Write-Log "EXO: Connection failed - $($_.Exception.Message)" -Level Warning
+                Write-Log 'Audit log enrichment will be skipped.' -Level Warning
+            }
+        }
+        else {
+            Write-Log 'EXO: Already connected.' -Level Success
         }
     }
 }
@@ -577,6 +637,7 @@ try {
     Write-Log "Include OneDrive:      $IncludeOneDriveSites"
     Write-Log "Graph-only mode:       $GraphOnly"
     Write-Log "Output:                $OutputPath"
+    Write-Log "Log file:              $($script:LogPath)"
     Write-Log '=========================================='
 
     # Step 1: Load modules
@@ -611,10 +672,14 @@ try {
     $affectedUsers = @{}
     $totalExternal = 0
     $alreadyB2B = 0
+    $noEmailCount = 0
+    $sitesWithExtUsers = 0
+    $sitesScanned = 0
     $siteIndex = 0
 
     foreach ($site in $sites) {
         $siteIndex++
+        $sitesScanned++
         $pct = [math]::Round(($siteIndex / $sites.Count) * 100, 1)
         Write-Progress -Activity 'Scanning sites for external users' -Status "$siteIndex / $($sites.Count) - $($site.Url)" -PercentComplete $pct
 
@@ -625,10 +690,16 @@ try {
             $siteExternalUsers = Get-ExternalUsersSPO -SiteUrl $site.Url
         }
 
+        $siteExtCount = 0
+        $siteB2BCount = 0
+        $siteAffectedCount = 0
+
         foreach ($ext in $siteExternalUsers) {
             $totalExternal++
+            $siteExtCount++
             $email = Coalesce $ext.Email $ext.AcceptedAs $ext.InvitedAs
             if (-not $email) {
+                $noEmailCount++
                 Write-Log "External user with no email on $($site.Url) - $($ext.DisplayName)" -Level Warning
                 continue
             }
@@ -645,10 +716,12 @@ try {
 
             if ($hasB2B) {
                 $alreadyB2B++
+                $siteB2BCount++
                 continue
             }
 
             # Affected user - accumulate sites
+            $siteAffectedCount++
             if ($affectedUsers.ContainsKey($email)) {
                 $existingSites = $affectedUsers[$email].Sites
                 if ($existingSites -notcontains $site.Url) {
@@ -685,8 +758,29 @@ try {
                 }
             }
         }
+
+        if ($siteExtCount -gt 0) {
+            $sitesWithExtUsers++
+            Write-Log "  $($site.Url) - ext: $siteExtCount, B2B: $siteB2BCount, affected: $siteAffectedCount"
+        }
+
+        # Progress summary every 50 sites
+        if ($siteIndex % 50 -eq 0) {
+            Write-Log "  [Progress] $siteIndex/$($sites.Count) sites scanned | ext: $totalExternal | B2B: $alreadyB2B | affected: $($affectedUsers.Count) | no-email: $noEmailCount"
+        }
     }
     Write-Progress -Activity 'Scanning sites for external users' -Completed
+
+    # Step 5 diagnostic summary
+    Write-Log ''
+    Write-Log '--- Step 5: Scan complete ---'
+    Write-Log "  Sites scanned:                 $sitesScanned"
+    Write-Log "  Sites with external users:     $sitesWithExtUsers"
+    Write-Log "  Total external user entries:    $totalExternal"
+    Write-Log "  Matched to B2B guest account:  $alreadyB2B"
+    Write-Log "  No email (skipped):            $noEmailCount"
+    Write-Log "  Unique affected users:         $($affectedUsers.Count)"
+    Write-Log ''
 
     # Step 6: Enrich with Unified Audit Log (best-effort)
     Write-Log '--- Step 6: Enriching activity data ---'
